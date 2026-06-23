@@ -1,5 +1,1 @@
-pandas
-numpy
-scikit-learn
-mlflow
-streamlit
+scikit-learn==1.4.2

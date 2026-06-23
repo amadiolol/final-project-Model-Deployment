@@ -1,95 +1,59 @@
 import streamlit as st
 import pandas as pd
-import pickle
-import numpy as np
-import re
+import boto3
+import json
 
-st.set_page_config(page_title="Credit Score Predictor", layout="wide")
-st.title("Credit Score Prediction Deployment")
-st.write("Aplikasi inferencing untuk memprediksi performa kredit nasabah langsung dari Dataset C.")
+st.set_page_config(page_title="Credit Score Predictor Cloud", layout="wide")
+st.title("Credit Score Prediction Deployment (AWS SageMaker)")
+st.write("Aplikasi inferencing ini terhubung langsung dengan AWS SageMaker Endpoint.")
 
-@st.cache_resource
-def load_components():
-    with open('best_rf_model.pkl', 'rb') as f:
-        model = pickle.load(f)
-    with open('label_encoders.pkl', 'rb') as f:
-        encoders = pickle.load(f)
-    return model, encoders
-
-model, encoders = load_components()
-
-def preprocess_input(df, encoders):
-    cols_to_drop = ['Unnamed: 0', 'ID', 'Customer_ID', 'Name', 'SSN', 'Month', 'Credit_Score']
-    df = df.drop(columns=[col for col in cols_to_drop if col in df.columns])
-    
-    if 'Occupation' in df.columns:
-        df['Occupation'] = df['Occupation'].replace('_______', np.nan)
-        
-    numeric_cols = ['Age', 'Annual_Income', 'Num_of_Loan', 'Num_of_Delayed_Payment',
-                    'Changed_Credit_Limit', 'Outstanding_Debt', 'Amount_invested_monthly']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r'[^0-9.-]', '', regex=True)
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-    def extract_months(text):
-        if pd.isna(text): return np.nan
-        years = re.search(r'(\d+)\s*Years', str(text))
-        months = re.search(r'(\d+)\s*Months', str(text))
-        y = int(years.group(1)) if years else 0
-        m = int(months.group(1)) if months else 0
-        return (y * 12) + m
-
-    if 'Credit_History_Age' in df.columns:
-        df['Credit_History_Age_Months'] = df['Credit_History_Age'].apply(extract_months)
-        df = df.drop(columns=['Credit_History_Age'])
-        
-    for col in df.select_dtypes(include=['float64', 'int64']).columns:
-        df[col] = df[col].fillna(df[col].median())
-    for col in df.select_dtypes(include=['object']).columns:
-        if not df[col].mode().empty:
-            df[col] = df[col].fillna(df[col].mode()[0])
-            
-    cat_cols = df.select_dtypes(include=['object']).columns
-    for col in cat_cols:
-        if col in encoders:
-            df[col] = df[col].apply(
-                lambda x: x if x in encoders[col].classes_ else encoders[col].classes_[0]
-            )
-            df[col] = encoders[col].transform(df[col])
-            
-    return df
+# Nama endpoint HARUS sama dengan yang ada di script deployment
+ENDPOINT_NAME = "credit-score-endpoint"
+REGION = "us-east-1"
 
 st.subheader("Data Nasabah:")
 
 try:
-   
     df_test = pd.read_csv('data_C.csv')
     st.write("Preview 5 Data Teratas:")
     st.dataframe(df_test.head(5))
     
     if st.button("Predict Credit Score"):
-        try:
-            df_clean = preprocess_input(df_test.copy(), encoders)
-            
-            predictions = model.predict(df_clean)
-            
-            target_mapping = {0: 'Poor', 1: 'Standard', 2: 'Good'}
-            df_test['Prediksi_Credit_Score'] = [target_mapping[p] for p in predictions]
-            
-            st.success("Prediksi Berhasil Dilakukan!")
-            st.write("Hasil Klasifikasi Kredit Nasabah:")
-            
-            display_cols = ['Customer_ID', 'Name', 'Prediksi_Credit_Score']
-            cols_to_show = [col for col in display_cols if col in df_test.columns]
-            
-            if not cols_to_show:
-                cols_to_show = ['Prediksi_Credit_Score']
+        with st.spinner("Memanggil AWS SageMaker Endpoint..."):
+            try:
+                # 1. Konversi data mentah menjadi JSON payload
+                # Kita batasi 100 data pertama agar payload JSON tidak terlalu besar untuk real-time inference
+                df_subset = df_test.head(100).copy() 
+                payload = {
+                    "instances": df_subset.to_dict(orient='records')
+                }
                 
-            st.dataframe(df_test[cols_to_show])
-            
-        except Exception as e:
-            st.error(f"Terjadi kesalahan teknis saat prediksi: {e}")
+                # 2. Panggil SageMaker Endpoint
+                runtime = boto3.client('sagemaker-runtime', region_name=REGION)
+                response = runtime.invoke_endpoint(
+                    EndpointName=ENDPOINT_NAME,
+                    ContentType='application/json',
+                    Accept='application/json',
+                    Body=json.dumps(payload)
+                )
+                
+                # 3. Ekstrak Hasil
+                result = json.loads(response['Body'].read().decode("utf-8"))
+                df_subset['Prediksi_Credit_Score'] = result['labels']
+                
+                st.success("Prediksi Berhasil Dilakukan via SageMaker!")
+                
+                # 4. Tampilkan Hasil
+                display_cols = ['Customer_ID', 'Name', 'Prediksi_Credit_Score']
+                cols_to_show = [col for col in display_cols if col in df_subset.columns]
+                
+                if not cols_to_show:
+                    cols_to_show = ['Prediksi_Credit_Score']
+                    
+                st.dataframe(df_subset[cols_to_show])
+                
+            except Exception as e:
+                st.error(f"Terjadi kesalahan teknis saat memanggil AWS Endpoint: {e}")
 
 except FileNotFoundError:
-    st.error("File 'data_C.csv' tidak ditemukan. Pastikan file tersebut berada di folder yang sama dengan file 'app.py' ini.")
+    st.error("File 'data_C.csv' tidak ditemukan. Pastikan file berada di direktori yang sama.")
